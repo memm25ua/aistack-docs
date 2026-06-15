@@ -6,7 +6,9 @@
 //   1. Broken internal links — standard Markdown links of the form
 //      `[text](target.md)` or `[text](target.md#heading)` (with or without
 //      a leading `./`/`../`) whose target file or heading anchor does not
-//      resolve. Links inside fenced or inline code blocks are ignored.
+//      resolve. Links inside fenced or inline code blocks are ignored, as
+//      are external links (`http://`, `https://`, `mailto:`, etc.) and
+//      anchor-only links (`#heading`).
 //   2. Frontmatter       — every note has a YAML frontmatter block with a
 //      `title`. Notes under `10-Projects/` and `20-Areas/` must also have
 //      at least one tag. `status` (if present) must be one of the values
@@ -66,10 +68,6 @@ const allFiles = [...walk(repoRoot)];
 const fileSet = new Set(allFiles.map((f) => resolve(f)));
 
 // ---------- helpers ----------
-
-function stripCode(raw) {
-  return raw.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]*`/g, "");
-}
 
 // GitHub-style heading slugifier: lowercase, drop punctuation (keep word
 // chars, spaces and hyphens), collapse spaces to hyphens.
@@ -169,9 +167,9 @@ function headingSlugs(file) {
   if (headingSlugCache.has(file)) return headingSlugCache.get(file);
   let slugs = new Set();
   try {
-    const stripped = stripCode(readFileSync(file, "utf8"));
-    for (const line of stripped.split(/\r?\n/)) {
-      const m = line.match(/^#{1,6}\s+(.+)$/);
+    for (const { text, inCode } of iterLines(readFileSync(file, "utf8"))) {
+      if (inCode) continue;
+      const m = text.match(/^#{1,6}\s+(.+)$/);
       if (m) slugs.add(slugify(m[1].trim()));
     }
   } catch {
@@ -181,6 +179,33 @@ function headingSlugs(file) {
   return slugs;
 }
 
+// Yields { text, inCode } for each line, with fenced code blocks (``` or ~~~)
+// marked as inCode (the fence delimiter lines themselves are also inCode).
+function* iterLines(raw) {
+  let fence = null;
+  for (const line of raw.split(/\r?\n/)) {
+    const fenceMatch = line.match(/^\s*(```+|~~~+)/);
+    if (fenceMatch) {
+      if (!fence) {
+        fence = fenceMatch[1][0];
+        yield { text: line, inCode: true };
+      } else if (line.trim().startsWith(fence)) {
+        fence = null;
+        yield { text: line, inCode: true };
+      } else {
+        yield { text: line, inCode: true };
+      }
+      continue;
+    }
+    yield { text: line, inCode: Boolean(fence) };
+  }
+}
+
+// Strips inline code spans (`...`) from a single line.
+function stripInlineCode(line) {
+  return line.replace(/`[^`\n]*`/g, "");
+}
+
 // Matches `](target.md)` or `](target.md#anchor)`, excluding external URLs.
 const LINK_RE = /\]\(([^)\s]+\.md(?:#[^)\s]*)?)\)/g;
 
@@ -188,29 +213,39 @@ const brokenLinks = [];
 for (const f of allFiles) {
   if (LINK_CHECK_SKIP_DIRS.has(folderOf(f))) continue;
   const raw = readFileSync(f, "utf8");
-  const scanned = stripCode(raw);
-  let m;
-  while ((m = LINK_RE.exec(scanned)) !== null) {
-    const target = m[1];
-    if (/^[a-z]+:\/\//i.test(target) || target.startsWith("/")) continue;
-    const [pathPart, anchor] = target.split("#");
-    const resolved = resolve(dirname(f), pathPart);
-    if (!fileSet.has(resolved)) {
-      brokenLinks.push({
-        file: relative(repoRoot, f),
-        target,
-        reason: "MISSING_FILE",
-      });
-      continue;
-    }
-    if (anchor) {
-      const slugs = headingSlugs(resolved);
-      if (slugs && !slugs.has(anchor)) {
+  let lineNo = 0;
+  for (const { text, inCode } of iterLines(raw)) {
+    lineNo++;
+    if (inCode) continue;
+    const scanned = stripInlineCode(text);
+    let m;
+    LINK_RE.lastIndex = 0;
+    while ((m = LINK_RE.exec(scanned)) !== null) {
+      const target = m[1];
+      if (/^[a-z]+:\/\//i.test(target) || target.startsWith("/")) continue;
+      const [pathPart, anchor] = target.split("#");
+      const resolved = resolve(dirname(f), pathPart);
+      if (!fileSet.has(resolved)) {
         brokenLinks.push({
           file: relative(repoRoot, f),
+          line: lineNo,
           target,
-          reason: "MISSING_ANCHOR",
+          reason: "MISSING_FILE",
+          message: `Link target \`${target}\` does not resolve to a file`,
         });
+        continue;
+      }
+      if (anchor) {
+        const slugs = headingSlugs(resolved);
+        if (slugs && !slugs.has(anchor)) {
+          brokenLinks.push({
+            file: relative(repoRoot, f),
+            line: lineNo,
+            target,
+            reason: "MISSING_ANCHOR",
+            message: `Link target \`${target}\` has no matching heading anchor`,
+          });
+        }
       }
     }
   }
@@ -232,24 +267,44 @@ for (const f of allFiles) {
   const content = readFileSync(f, "utf8");
   const fm = parseFrontmatter(content);
   if (!fm.ok) {
-    frontmatterIssues.push({ file: rel, issue: fm.reason });
+    frontmatterIssues.push({
+      file: rel,
+      line: 1,
+      issue: fm.reason,
+      message:
+        fm.reason === "NO_FRONTMATTER"
+          ? "Missing YAML frontmatter block"
+          : "Frontmatter block is malformed",
+    });
     continue;
   }
   const fields = fm.fields;
   if (typeof fields.title !== "string" || fields.title.length === 0) {
-    frontmatterIssues.push({ file: rel, issue: "MISSING_TITLE" });
+    frontmatterIssues.push({
+      file: rel,
+      line: 1,
+      issue: "MISSING_TITLE",
+      message: "Frontmatter is missing required `title`",
+    });
   }
   // Tags are required in 10-Projects/ and 20-Areas/.
   const folder = folderOf(f);
   const tags = fields.tags;
   const tagCount = Array.isArray(tags) ? tags.length : tags ? 1 : 0;
   if ((folder === "10-Projects" || folder === "20-Areas") && tagCount === 0) {
-    frontmatterIssues.push({ file: rel, issue: "MISSING_TAGS" });
+    frontmatterIssues.push({
+      file: rel,
+      line: 1,
+      issue: "MISSING_TAGS",
+      message: `Notes in ${folder}/ must have at least one tag`,
+    });
   }
   if (typeof fields.status === "string" && !ALLOWED_STATUS.has(fields.status)) {
     frontmatterIssues.push({
       file: rel,
+      line: 1,
       issue: `INVALID_STATUS:${fields.status}`,
+      message: `\`status: ${fields.status}\` is not one of the allowed values`,
     });
   }
 }
@@ -268,10 +323,12 @@ if (existsSync(inboxDir)) {
     const changedMs = Date.parse(changedIso);
     if (Number.isNaN(changedMs)) continue;
     if (changedMs < cutoff) {
+      const ageDays = Math.floor((Date.now() - changedMs) / (24 * 60 * 60 * 1000));
       staleInbox.push({
         file: relative(repoRoot, f),
         lastChanged: changedIso,
-        ageDays: Math.floor((Date.now() - changedMs) / (24 * 60 * 60 * 1000)),
+        ageDays,
+        message: `Last changed ${ageDays}d ago (> ${staleDays}d threshold)`,
       });
     }
   }
@@ -281,66 +338,52 @@ if (existsSync(inboxDir)) {
 // ---------- report ----------
 
 const summary = {
-  filesScanned: allFiles.length,
-  brokenLinks: brokenLinks.length,
-  frontmatterIssues: frontmatterIssues.length,
+  links: brokenLinks.length,
+  frontmatter: frontmatterIssues.length,
   staleInbox: staleInbox.length,
 };
 const report = {
-  root: repoRoot,
-  generatedAt: new Date().toISOString(),
-  staleDaysThreshold: staleDays,
   summary,
-  details: { brokenLinks, frontmatterIssues, staleInbox },
+  findings: {
+    links: brokenLinks,
+    frontmatter: frontmatterIssues,
+    staleInbox,
+  },
 };
 
 if (jsonOut) {
-  process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+  const indent = process.stdout.isTTY ? 2 : 0;
+  process.stdout.write(JSON.stringify(report, null, indent) + "\n");
 } else {
   const lines = [];
-  lines.push(`# Vault hygiene report — ${report.generatedAt}`);
-  lines.push("");
-  lines.push(`- Root: \`${repoRoot}\``);
-  lines.push(`- Files scanned: ${summary.filesScanned}`);
-  lines.push(`- Stale-inbox threshold: ${staleDays} days`);
-  lines.push("");
-  lines.push("## Summary");
-  lines.push(`- Broken links: **${summary.brokenLinks}**`);
-  lines.push(`- Frontmatter issues: **${summary.frontmatterIssues}**`);
-  lines.push(`- Stale inbox items: **${summary.staleInbox}**`);
-  lines.push("");
-  if (summary.brokenLinks > 0) {
+  lines.push(
+    `Broken links / Frontmatter issues / Stale inbox items: ` +
+      `${summary.links} / ${summary.frontmatter} / ${summary.staleInbox}`,
+  );
+  lines.push("Anything other than 0/0/0 needs a look.");
+  if (summary.links > 0) {
+    lines.push("");
     lines.push("## Broken links");
     for (const b of brokenLinks) {
-      lines.push(`- \`${b.file}\` → \`${b.target}\` (${b.reason})`);
+      lines.push(`- \`${b.file}:${b.line}\` — ${b.message}`);
     }
-    lines.push("");
   }
-  if (summary.frontmatterIssues > 0) {
+  if (summary.frontmatter > 0) {
+    lines.push("");
     lines.push("## Frontmatter issues");
     for (const f of frontmatterIssues) {
-      lines.push(`- \`${f.file}\`: ${f.issue}`);
+      lines.push(`- \`${f.file}:${f.line}\` — ${f.message}`);
     }
-    lines.push("");
   }
   if (summary.staleInbox > 0) {
+    lines.push("");
     lines.push(`## Stale inbox items (> ${staleDays} days)`);
     for (const s of staleInbox) {
-      lines.push(`- \`${s.file}\` — last changed ${s.lastChanged} (${s.ageDays} d)`);
+      lines.push(`- \`${s.file}\` — ${s.message}`);
     }
-    lines.push("");
   }
-  if (
-    summary.brokenLinks === 0 &&
-    summary.frontmatterIssues === 0 &&
-    summary.staleInbox === 0
-  ) {
-    lines.push("All clean. No action required.");
-    lines.push("");
-  }
-  process.stdout.write(lines.join("\n"));
+  process.stdout.write(lines.join("\n") + "\n");
 }
 
-const dirty =
-  summary.brokenLinks + summary.frontmatterIssues + summary.staleInbox;
+const dirty = summary.links + summary.frontmatter + summary.staleInbox;
 process.exit(dirty === 0 ? 0 : 1);
